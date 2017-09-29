@@ -1,10 +1,11 @@
-# Replicates tags to snapshots and volumes
+# Replicates tags to snapshot and volume using tags from volume/instance and ami(from snapshot description)
 # Dmitry Aliev (c)
 
 # TODO
+# README.md
+# Add info on where tag came from
 # Volumes not exist stat + CSV status
 # No tags neither at volume nor instance + CSV status
-# AMI tag source
 
 from __future__ import print_function
 import boto3
@@ -30,6 +31,8 @@ Cost tag replicator. Scans for <tags> untagged snapshots and tags snapshot with 
                         help="AWS region (us-east-1 by default)")
     parser.add_argument("--tags", action='store', type=str, required=True,
                         help="List of tags to replicate, separated by comma, e.g Owner,cost (case sensitive")
+    parser.add_argument("--ami-lookup", action="store_true", default=False,
+                        help="Lookup for tags from AMI. False by default")
     parser.add_argument("--stats-only", action="store_true", default=False,
                         help="Print stats on snapshots total vs cost untagged and exit")
     parser.add_argument("--report", action="store_true", default=False,
@@ -42,16 +45,18 @@ Cost tag replicator. Scans for <tags> untagged snapshots and tags snapshot with 
     profile = args.profile
     region = args.region
     stats_only = args.stats_only
+    ami_lookup = args.ami_lookup
     dryrun = args.dry_run
     report = args.report
 
-    return (tags_list, profile, region, stats_only, dryrun, report)
+    return (tags_list, profile, region, stats_only, ami_lookup, dryrun, report)
 
 
 class TagReplicator:
 
     def __init__(self):
         self.ec2 = None
+        self.ec2client = None
 
         self.profile = None
         self.region = 'us-east-1'
@@ -89,6 +94,27 @@ class TagReplicator:
             ]
         )
 
+    def tag_resource_with_tags(self, resource, tags, dryrun, index=0):
+        prefix = resource.id.split('-')[0]
+        self.count_propagated_tags[prefix] += len(tags)
+        tags_to_create = []
+        for key, value in tags.iteritems():
+            tags_to_create.append(
+                {
+                    'Key': key,
+                    'Value': value
+                }
+            )
+            self.print("{idx} Tagging {dst:22} with tag:{key}={value} {note}".format(
+                idx=index if index else '',
+                dst=resource.id,
+                key=key,
+                value=value,
+                note='(dry run)' if dryrun else ''))
+        if dryrun:
+            return
+        resource.create_tags(Tags=tags_to_create)
+
     def tag_resource_from(self, src_r, src_details, dst_r, dst_details, tags, dryrun=False):
         tags_copied = {}
         for dtag in tags:
@@ -105,6 +131,14 @@ class TagReplicator:
                     tags_copied[dtag] = src_details['tags'].get(dtag)
         return tags_copied
 
+    def extract_untagged(self, src_details, dst_details, tags):
+        missing_tags = {}
+        for dtag in tags:
+            if src_details['tags'].get(dtag):
+                if not dst_details['tags'].get(dtag):
+                    missing_tags[dtag] = src_details['tags'].get(dtag)
+        return missing_tags
+
     def get_tag(self, details, key, default=''):
         if details.get('tags'):
             return details.get('tags').get(key, default)
@@ -114,6 +148,7 @@ class TagReplicator:
         # TODO: Exception handling, Return tuple (true/false, error message)
         session = boto3.Session(profile_name=profile, region_name=region)
         self.ec2 = session.resource('ec2')
+        self.ec2client = session.client('ec2')
 
         try:
             self.owner_account_id = session.client('sts').get_caller_identity()['Account']
@@ -148,6 +183,17 @@ class TagReplicator:
         snaps_tagged = self.ec2.snapshots.filter(Filters=tags_filter)
         snaps_tagged_ids = [s.snapshot_id for s in snaps_tagged]
         return set(snaps_all_ids) - set(snaps_tagged_ids)
+
+    def get_ami_details(self, ami_id):
+        try:
+            response = self.ec2client.describe_images(ImageIds=[ami_id])
+        except ClientError as e:
+            if e.response['Error']['Code'] == 'InvalidAMIID.NotFound':
+                return {}
+
+        _tags = response['Images'][0].get('Tags')
+        ami_tags = {s['Key']: s['Value'] for s in _tags} if _tags else {}
+        return {'tags': ami_tags}
 
     def get_snapshot_details(self, snap):
         # TODO: Check if snapshot exists ??
@@ -190,7 +236,7 @@ class TagReplicator:
         d = datetime.now() - self.start_time
         print("%3s %s %s" % (d.seconds, 'sec |', msg))
 
-    def do_tagging(self, desired_tags, dryrun, stats_only, do_report):
+    def do_tagging(self, desired_tags, dryrun, stats_only, ami_lookup, do_report):
         # TODO
         # Rework Report for multiple tags
 
@@ -220,8 +266,6 @@ class TagReplicator:
             csv_out.writerow(header_row)
 
         for idx, snapshot_id in enumerate(untagged_snapshots):
-            snap_tagged = vol_tagged = {}
-
             snap = self.ec2.Snapshot(snapshot_id)
             snap_details = self.get_snapshot_details(snap)
             volume = self.ec2.Volume(snap_details['volume_id'])
@@ -229,37 +273,64 @@ class TagReplicator:
             instance = None
             instance_details = {}
 
-            # 1 gather tag for each entity
-            # tags_for_volume
-            # tags_for_snapshot
-            #
-            # 2 then actual tag
+            extracted_tags = {}
+            tags_for_volume = {}
+            tags_for_snapshot = {}
+
+            # Gather tags to replicate for each entity vol snap
+            # Snap <- Vol 
+            # if instance attached:
+            #         Vol <- Instance
+            # Snap <-------- Instance
+            # if ami_lookup and ami found in description
+            # Snap <-------- AMI
+            #         Vol <- AMI
+
             if self.volume_exists(snap_details['volume_id']):
-                # Snapshot refers to existing volume | # Update tag info to avoid second tagging
+                extracted_tags = self.extract_untagged(volume_details, snap_details, desired_tags)
+                tags_for_snapshot = dict(extracted_tags.items() + tags_for_snapshot.items())
 
-                snap_tagged = self.tag_resource_from(volume, volume_details, snap, snap_details, desired_tags, dryrun=dryrun)
-                snap_details['tags'] = dict(snap_details['tags'].items() + snap_tagged.items())
-
-                #!!! Add AMI lookup
+                # If volume have instance attached and has some desired tags omitted So try to complete with instance tags.
                 if volume.attachments and set(volume_details['tags'].keys()) != set(desired_tags):
-                    # Volume has instance attached and volume has some desired tags omitted. So try to complete with instance tags.
                     instance = self.ec2.Instance(volume.attachments[0]['InstanceId'])
                     instance_details = self.get_instance_details(instance)
 
-                    # if do_volume_tagging then
-                    vol_tagged = self.tag_resource_from(instance, instance_details, volume, volume_details, desired_tags, dryrun=dryrun)
-                    volume_details['tags'] = dict(volume_details['tags'].items() + vol_tagged.items())
+                    # complete tags_for_snapshot with instance tags
+                    extracted_tags = self.extract_untagged(instance_details, snap_details, desired_tags)
+                    tags_for_snapshot = dict(extracted_tags.items() + tags_for_snapshot.items())
 
+                    # complete tags_for_volume with instance tags
+                    extracted_tags = self.extract_untagged(instance_details, volume_details, desired_tags)
+                    tags_for_volume = dict(extracted_tags.items() + tags_for_volume.items())
 
+            # AMI lookup if requested
+            if ami_lookup and snap_details['description_ami']:
+                ami_details = self.get_ami_details(snap_details['description_ami'])
+                if ami_details:
+                    # Snapshot <- AMI gathering
+                    extracted_tags = self.extract_untagged(ami_details, snap_details, desired_tags)
+#                    snap_tags_before_ami = tags_for_snapshot
+#                    tags_from_ami_only = {k:extracted_tags[k] for k in set(extracted_tags) - set(tags_for_snapshot)}
+                    tags_for_snapshot = dict(extracted_tags.items() + tags_for_snapshot.items())
 
-                    snap_tagged = self.tag_resource_from(instance, instance_details, snap, snap_details, desired_tags, dryrun=dryrun)
-                    snap_details['tags'] = dict(snap_details['tags'].items() + snap_tagged.items())
+                    # if ami_details['tags']:
+                    #     print('AMI tags: ', ami_details['tags'])
+                    #     print('Snap tags before: ', snap_tags_before_ami)
+                    #     print('AMI tags not it Snap: ', tags_from_ami_only)
 
+                    # Volume <- AMI gathering
+                    if self.volume_exists(snap_details['volume_id']):
+                        extracted_tags = self.extract_untagged(ami_details, volume_details, desired_tags)
+                        tags_for_volume = dict(extracted_tags.items() + tags_for_volume.items())
 
-            if len(vol_tagged):
-                self.count_tagged_resources['vol'] += 1
-            if len(snap_tagged):
+            # Tagging with gathered tags
+            self.tag_resource_with_tags(snap, tags_for_snapshot, dryrun, idx)
+            self.tag_resource_with_tags(volume, tags_for_volume, dryrun, idx)
+
+            if tags_for_snapshot:
                 self.count_tagged_resources['snap'] += 1
+            if tags_for_volume:
+                self.count_tagged_resources['vol'] += 1
 
             # Assemble row for csv
             data_row = [snap_details['id']]
@@ -287,20 +358,18 @@ class TagReplicator:
         self.print("%-35s %s" % ("Volumes tagged:", self.count_tagged_resources['vol']))
         self.print("See %s for detailed report. " % (csv_filename) if do_report else '')
 
-        #self.print("%-35s %s" % ("Volumes not exist(!!!!!!):", volumes_not_exist_count))
-        #self.print("%-35s %s" % ("No tags neither at volume nor instance :", no_one_has_tags_count))
-
 
 def main():
-    tags_list, profile, region, stats_only, dryrun, report = parse_arguments()
+    tags_list, profile, region, stats_only, ami_lookup, dryrun, report = parse_arguments()
     tagging = TagReplicator()
     tagging.connect(profile, region)
-    tagging.do_tagging(tags_list, dryrun, stats_only, report)
+    tagging.do_tagging(tags_list, dryrun, stats_only, ami_lookup, report)
 
 
 def lambda_handler():
-    env_region = os.environ.get('REGION','us-east-1')
+    env_region = os.environ.get('REGION', 'us-east-1')
     env_dryrun = False if os.environ.get('DRYRUN', False) in ['False', False, 'No'] else True
+    env_ami_lookup = False if os.environ.get('AMI_LOOKUP', False) in ['False', False, 'No'] else True
     env_tags = os.environ['TAGS'].split(',')
     if not env_tags:
         print('No tags specified')
@@ -308,7 +377,7 @@ def lambda_handler():
 
     tagging = TagReplicator()
     tagging.connect(profile=None, region=env_region)
-    tagging.do_tagging(tags_list=env_tags, dryrun=env_dryrun, stats_only=False, report=False)
+    tagging.do_tagging(tags_list=env_tags, dryrun=env_dryrun, stats_only=False, ami_lookup=env_ami_lookup, report=False)
 
 
 if __name__ == '__main__':
