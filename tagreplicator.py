@@ -22,7 +22,7 @@ def parse_arguments():
     REGION = 'us-east-1'
     PROFILE = None
     parser = argparse.ArgumentParser(description="""
-Cost tag replicator. Scans for <tags> untagged snapshots and tags snapshot with volume/instance/ami tag.
+Tag replicator. Scans for <tags> untagged snapshots and tags snapshots/volumes with volume/instance/ami tag.
 """)
 
     parser.add_argument("--profile", required=False, default=PROFILE, type=str,
@@ -30,11 +30,11 @@ Cost tag replicator. Scans for <tags> untagged snapshots and tags snapshot with 
     parser.add_argument("--region", required=False, default=REGION, type=str,
                         help="AWS region (us-east-1 by default)")
     parser.add_argument("--tags", action='store', type=str, required=True,
-                        help="List of tags to replicate, separated by comma, e.g Owner,cost (case sensitive")
+                        help="List of tags to replicate, separated by comma, e.g Owner,cost (case sensitive)")
     parser.add_argument("--ami-lookup", action="store_true", default=False,
                         help="Lookup for tags from AMI. False by default")
     parser.add_argument("--stats-only", action="store_true", default=False,
-                        help="Print stats on snapshots total vs cost untagged and exit")
+                        help="Print stats on snapshots total vs <tags> untagged snapshots and exit")
     parser.add_argument("--report", action="store_true", default=False,
                         help="Generate csv report")
     parser.add_argument("--dry-run", action="store_true", default=False,
@@ -366,7 +366,7 @@ def main():
     tagging.do_tagging(tags_list, dryrun, stats_only, ami_lookup, report)
 
 
-def lambda_handler():
+def lambda_handler(event, context):
     env_region = os.environ.get('REGION', 'us-east-1')
     env_dryrun = False if os.environ.get('DRYRUN', False) in ['False', False, 'No'] else True
     env_ami_lookup = False if os.environ.get('AMI_LOOKUP', False) in ['False', False, 'No'] else True
@@ -377,7 +377,7 @@ def lambda_handler():
 
     tagging = TagReplicator()
     tagging.connect(profile=None, region=env_region)
-    tagging.do_tagging(tags_list=env_tags, dryrun=env_dryrun, stats_only=False, ami_lookup=env_ami_lookup, report=False)
+    tagging.do_tagging(desired_tags=env_tags, dryrun=env_dryrun, stats_only=False, ami_lookup=env_ami_lookup, do_report=False)
 
 
 if __name__ == '__main__':
